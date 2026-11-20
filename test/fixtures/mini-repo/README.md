@@ -1,0 +1,2 @@
+# Mini fixture
+ignored
