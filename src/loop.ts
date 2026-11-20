@@ -407,6 +407,53 @@ async function executeCalls(options: {
 	return { results, summaries };
 }
 
+const RESCUE_EVIDENCE_MAX_CHARS = 24_000;
+
+/**
+ * Fresh, history-free context for the final report-only attempt: the query plus
+ * successful tool outputs seen so far (newest kept when over budget).
+ */
+export function buildRescueContext(
+	query: string,
+	messages: readonly Message[],
+	maxResults: number,
+	tools: Tool[],
+): Context {
+	const blocks: string[] = [];
+	let total = 0;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i]!;
+		if (m.role !== "toolResult" || m.isError) continue;
+		const text = m.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("");
+		if (!text) continue;
+		const block = `--- ${m.toolName} output ---\n${text}`;
+		if (total + block.length > RESCUE_EVIDENCE_MAX_CHARS) break;
+		blocks.unshift(block);
+		total += block.length;
+	}
+
+	const content = [
+		`Query: ${query}`,
+		"",
+		"Search output collected so far:",
+		blocks.length > 0 ? blocks.join("\n\n") : "(none)",
+		"",
+		`Call the report tool now with up to ${maxResults} locations from the output above.`,
+	].join("\n");
+
+	return {
+		systemPrompt:
+			"You are a code locator. Searching is over; the only available tool is report. " +
+			"Respond with exactly one report call. Line numbers must come from the provided output. " +
+			"Use an empty results array if nothing is relevant.",
+		messages: [{ role: "user", content, timestamp: Date.now() }],
+		tools,
+	};
+}
+
 /**
  * Run the bounded read-only search loop with a sub-model.
  */
@@ -524,20 +571,24 @@ export async function runSearchLoop(options: RunSearchLoopOptions): Promise<Loop
 	};
 
 	try {
-		for (let turn = 1; turn <= config.maxTurns; turn++) {
+		// One extra report-only rescue turn if the last regular turn ends without report.
+		for (let turn = 1; turn <= config.maxTurns + 1; turn++) {
 			if (signal.aborted) {
 				return finishDueToAbort();
 			}
 
 			turns = turn;
 			const toolsForTurn: Tool[] =
-				turn === config.maxTurns ? bundle.reportOnlyTools : bundle.allTools;
+				turn >= config.maxTurns ? bundle.reportOnlyTools : bundle.allTools;
 
-			const context: Context = {
-				systemPrompt,
-				messages,
-				tools: toolsForTurn,
-			};
+			const isRescue = turn > config.maxTurns;
+			const context: Context = isRescue
+				? buildRescueContext(query, messages, maxResults, bundle.reportOnlyTools)
+				: {
+						systemPrompt,
+						messages,
+						tools: toolsForTurn,
+					};
 
 			const streamOpts: {
 				signal: AbortSignal;
@@ -549,7 +600,7 @@ export async function runSearchLoop(options: RunSearchLoopOptions): Promise<Loop
 				signal,
 				maxTokens: MAX_TOKENS,
 				cacheRetention: "short",
-				sessionId,
+				sessionId: isRescue ? uuidv7() : sessionId,
 			};
 			const reasoning = reasoningOption(config.reasoning, model);
 			if (reasoning) streamOpts.reasoning = reasoning;
@@ -654,6 +705,36 @@ export async function runSearchLoop(options: RunSearchLoopOptions): Promise<Loop
 					turns,
 					turnHistory,
 				});
+			}
+
+			if (turn >= config.maxTurns) {
+				if (turn > config.maxTurns) break;
+				const summaries: TurnCallSummary[] = calls.map((c) => ({
+					name: c.name,
+					arguments: (c.arguments ?? {}) as Record<string, unknown>,
+					skipped: true,
+					isError: true,
+				}));
+				for (const c of calls) {
+					messages.push(
+						toToolResultMessage(
+							c.id,
+							c.name,
+							errorToolResult("No more searches allowed. Call report now."),
+						),
+					);
+				}
+				if (calls.length === 0) {
+					messages.push({
+						role: "user",
+						content: NUDGE_REPORT_MESSAGE,
+						timestamp: Date.now(),
+					});
+				}
+				warnings.push("No report on final turn; retrying once with report only");
+				turnHistory.push({ turn, calls: summaries });
+				emitProgress(turn, 0, summaries);
+				continue;
 			}
 
 			if (calls.length === 0) {

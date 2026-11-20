@@ -264,6 +264,7 @@ describe("runSearchLoop", () => {
 				toolCalls: [toolCall("grep", { pattern: "greet", path: "src" })],
 				usage: usage({ input: 1, output: 1 }),
 			}),
+			assistant({ text: "done", stopReason: "stop", usage: usage({ input: 1, output: 1 }) }),
 		]);
 
 		const result = await runSearchLoop({
@@ -278,13 +279,52 @@ describe("runSearchLoop", () => {
 		assert.equal(result.truncated, true);
 		assert.ok(result.warnings.some((w) => /maxTurns/i.test(w)));
 		// Last turn should only expose report tool
-		const lastTools = registry.calls[1]!.tools!.map((t) => t.name);
-		assert.deepEqual(lastTools, ["report"]);
-		// Model ignored report-only and called grep — those execute via bundle still? 
-		// Wait: on last turn toolsForTurn is reportOnly, but the fake still returns grep calls.
-		// The loop will try to execute grep via bundle.execute — that's fine.
-		// Degraded hits may come from real grep output containing path:line.
-		assert.ok(result.results.length >= 0);
+		assert.equal(registry.calls.length, 3);
+		for (const ctx of registry.calls.slice(1)) {
+			assert.deepEqual(ctx.tools!.map((t) => t.name), ["report"]);
+		}
+		assert.ok(result.results.length > 0);
+	});
+
+	it("rescue turn: report after ignoring report-only final turn", async () => {
+		const registry = scriptedRegistry([
+			assistant({
+				toolCalls: [toolCall("grep", { pattern: "greet", path: "src" })],
+				usage: usage({ input: 1, output: 1 }),
+			}),
+			assistant({
+				toolCalls: [toolCall("read", { path: "src/hello.ts" })],
+				usage: usage({ input: 1, output: 1 }),
+			}),
+			assistant({
+				toolCalls: [
+					toolCall("report", {
+						results: [{ path: "src/hello.ts", startLine: 1, endLine: 2, reason: "ok" }],
+					}),
+				],
+				usage: usage({ input: 1, output: 1 }),
+			}),
+		]);
+
+		const result = await runSearchLoop({
+			model: fakeModel(),
+			modelRegistry: registry,
+			config: baseConfig({ maxTurns: 2 }),
+			query: "greet",
+			cwd: miniRepo,
+		});
+
+		assert.equal(result.kind, "report");
+		assert.equal(result.turns, 3);
+		assert.equal(result.results[0]!.path, "src/hello.ts");
+		const rescue = registry.calls[2]!;
+		assert.deepEqual(rescue.tools!.map((t) => t.name), ["report"]);
+		assert.equal(rescue.messages.length, 1);
+		const rescueMsg = rescue.messages[0]!;
+		assert.equal(rescueMsg.role, "user");
+		assert.ok(typeof rescueMsg.content === "string" && rescueMsg.content.includes("Query: greet"));
+		assert.ok(rescueMsg.content.includes("--- grep output ---"));
+		assert.ok(!rescueMsg.content.includes("No more searches allowed"));
 	});
 
 	it("skips calls beyond maxParallelCalls", async () => {
