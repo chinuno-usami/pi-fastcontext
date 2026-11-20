@@ -36,7 +36,7 @@ npm test
 
 | 方式 | 说明 |
 |------|------|
-| `/fastcontext-model` | 交互选择 `provider/modelId`（无 UI 时仅接受参数形式） |
+| `/fastcontext-model` | 交互选择 `provider/modelId`（TUI 支持关键字/模糊搜索过滤；无 UI 时仅接受参数形式） |
 | `/fastcontext-model provider/id` | 直接设置并写入全局配置 |
 | `/fastcontext-model --project …` | 写入项目配置（需项目已信任） |
 | `/fastcontext-model clear` | 清除对应范围的 `model` |

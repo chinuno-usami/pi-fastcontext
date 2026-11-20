@@ -2,14 +2,24 @@
  * Sub-model resolution, /fastcontext-model command, --fastcontext-model flag, status. (M1)
  */
 import type { Model } from "@earendil-works/pi-ai";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-	ModelRegistry,
-	ScopedModel,
+import {
+	DynamicBorder,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type ModelRegistry,
+	type ScopedModel,
 } from "@earendil-works/pi-coding-agent";
-import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import {
+	Container,
+	fuzzyFilter,
+	Input,
+	type AutocompleteItem,
+	type SelectItem,
+	SelectList,
+	Spacer,
+	Text,
+} from "@earendil-works/pi-tui";
 import { loadConfig, saveConfig, type FastContextConfig } from "./config.ts";
 
 export const FLAG_NAME = "fastcontext-model";
@@ -105,10 +115,169 @@ export function buildSelectItems(models: readonly Model<string>[]): string[] {
 	return models.map(formatModelSelectLabel);
 }
 
+/** SelectList items: value is provider/id; label may include cost. */
+export function buildModelSelectItems(models: readonly Model<string>[]): SelectItem[] {
+	return models.map((m) => ({
+		value: modelRef(m),
+		label: formatModelSelectLabel(m),
+	}));
+}
+
+/**
+ * Keyword / fuzzy filter for the model selector (and argument completions).
+ * Empty query returns all items in original order.
+ */
+export function filterModelSelectItems(
+	items: readonly SelectItem[],
+	query: string,
+): SelectItem[] {
+	const q = query.trim();
+	if (!q) {
+		return [...items];
+	}
+	return fuzzyFilter([...items], q, (item) => `${item.value} ${item.label}`);
+}
+
 /** Recover provider/id from a select label that may include cost suffix. */
 export function refFromSelectLabel(label: string): string {
 	const cut = label.indexOf("  (");
 	return (cut >= 0 ? label.slice(0, cut) : label).trim();
+}
+
+const MODEL_SELECT_LIST_LAYOUT = {
+	minPrimaryColumnWidth: 24,
+	maxPrimaryColumnWidth: 96,
+};
+
+/**
+ * Interactive model pick: TUI uses type-to-search (fuzzy); RPC/other falls back to ui.select.
+ * Returns provider/id, or undefined if cancelled.
+ */
+export async function selectModelInteractively(
+	ctx: ExtensionCommandContext,
+	title: string,
+	items: readonly SelectItem[],
+): Promise<string | undefined> {
+	if (items.length === 0) {
+		return undefined;
+	}
+
+	if (ctx.mode === "tui") {
+		const chosen = await ctx.ui.custom<string | undefined>(
+			(tui, theme, keybindings, done) => {
+				const allItems = [...items];
+				const searchInput = new Input();
+				const listContainer = new Container();
+				let selectList: SelectList;
+
+				const listTheme = {
+					selectedPrefix: (text: string) => theme.fg("accent", text),
+					selectedText: (text: string) => theme.fg("accent", text),
+					description: (text: string) => theme.fg("muted", text),
+					scrollInfo: (text: string) => theme.fg("muted", text),
+					noMatch: (text: string) => theme.fg("muted", text),
+				};
+
+				const buildList = (filtered: readonly SelectItem[], preselect?: string): SelectList => {
+					const list = new SelectList(
+						[...filtered],
+						Math.min(Math.max(filtered.length, 1), 10),
+						listTheme,
+						MODEL_SELECT_LIST_LAYOUT,
+					);
+					if (preselect) {
+						const idx = filtered.findIndex((i) => i.value === preselect);
+						if (idx >= 0) {
+							list.setSelectedIndex(idx);
+						}
+					}
+					list.onSelect = (item) => done(item.value);
+					list.onCancel = () => done(undefined);
+					return list;
+				};
+
+				const applyFilter = (query: string) => {
+					const filtered = filterModelSelectItems(allItems, query);
+					const prev = selectList.getSelectedItem()?.value;
+					selectList = buildList(filtered, prev);
+					listContainer.clear();
+					listContainer.addChild(selectList);
+					tui.requestRender();
+				};
+
+				searchInput.onSubmit = () => {
+					selectList.handleInput("\r");
+				};
+
+				selectList = buildList(allItems);
+				listContainer.addChild(selectList);
+
+				const container = new Container();
+				container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("accent", theme.bold(title)), 0, 0));
+				container.addChild(new Spacer(1));
+				container.addChild(searchInput);
+				container.addChild(new Spacer(1));
+				container.addChild(listContainer);
+				container.addChild(new Spacer(1));
+				container.addChild(
+					new Text(
+						theme.fg(
+							"dim",
+							"  Type to filter · ↑↓ navigate · Enter to select · Esc to cancel",
+						),
+						0,
+						0,
+					),
+				);
+				container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
+
+				let focused = true;
+				return {
+					get focused() {
+						return focused;
+					},
+					set focused(value: boolean) {
+						focused = value;
+						searchInput.focused = value;
+					},
+					capturesViewportInput: true,
+					render(width: number) {
+						return container.render(width);
+					},
+					invalidate() {
+						container.invalidate();
+					},
+					handleInput(data: string) {
+						const isNav =
+							keybindings.matches(data, "tui.select.up") ||
+							keybindings.matches(data, "tui.select.down") ||
+							keybindings.matches(data, "tui.select.pageUp") ||
+							keybindings.matches(data, "tui.select.pageDown") ||
+							keybindings.matches(data, "tui.select.confirm") ||
+							keybindings.matches(data, "tui.select.cancel");
+						if (isNav) {
+							selectList.handleInput(data);
+							tui.requestRender();
+							return;
+						}
+						searchInput.handleInput(data);
+						applyFilter(searchInput.getValue());
+					},
+				};
+			},
+			{ blocked: { kind: "question", message: title } },
+		);
+		return chosen;
+	}
+
+	const labels = items.map((i) => i.label);
+	const picked = await ctx.ui.select(title, labels);
+	if (!picked) {
+		return undefined;
+	}
+	return refFromSelectLabel(picked);
 }
 
 export type ParsedCommandArgs = {
@@ -320,15 +489,15 @@ async function openSelector(
 		return;
 	}
 
-	const items = buildSelectItems(candidates);
+	const items = buildModelSelectItems(candidates);
 	const title = project
 		? "Select fastcontext model (project config)"
 		: "Select fastcontext model";
-	const chosen = await ctx.ui.select(title, items);
+	const chosen = await selectModelInteractively(ctx, title, items);
 	if (!chosen) {
 		return;
 	}
-	await applyModelChoice(ctx, pi, refFromSelectLabel(chosen), project);
+	await applyModelChoice(ctx, pi, chosen, project);
 }
 
 export async function handleFastContextModelCommand(

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { Model } from "@earendil-works/pi-ai";
 import {
+	buildModelSelectItems,
 	buildSelectItems,
+	filterModelSelectItems,
 	formatModelSelectLabel,
 	formatStatus,
 	getArgumentCompletions,
@@ -96,6 +98,32 @@ describe("model-select", () => {
 		const listed = listCandidateModels([{ model: b }, { model: a }], [a, c, b]);
 		assert.deepEqual(listed.map(modelRef), ["b/2", "a/1", "c/3"]);
 		assert.deepEqual(buildSelectItems([a]).map(refFromSelectLabel), ["a/1"]);
+		assert.deepEqual(
+			buildModelSelectItems([a]).map((i) => i.value),
+			["a/1"],
+		);
+	});
+
+	it("filterModelSelectItems fuzzy-matches provider/id keywords", () => {
+		const items = buildModelSelectItems([
+			fakeModel("openai", "gpt-4o-mini"),
+			fakeModel("anthropic", "claude-haiku"),
+			fakeModel("openrouter", "qwen/qwen3-coder"),
+		]);
+		assert.equal(filterModelSelectItems(items, "").length, 3);
+		assert.deepEqual(
+			filterModelSelectItems(items, "haiku").map((i) => i.value),
+			["anthropic/claude-haiku"],
+		);
+		assert.deepEqual(
+			filterModelSelectItems(items, "openai mini").map((i) => i.value),
+			["openai/gpt-4o-mini"],
+		);
+		assert.deepEqual(
+			filterModelSelectItems(items, "qwen").map((i) => i.value),
+			["openrouter/qwen/qwen3-coder"],
+		);
+		assert.deepEqual(filterModelSelectItems(items, "zzz-no-match"), []);
 	});
 
 	it("resolveSubModel: unset / flag over config / not_found / no_auth / sameAsMain", () => {
